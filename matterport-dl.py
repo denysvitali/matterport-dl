@@ -434,9 +434,9 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
             logging.info(f'Redirecting {orig_request} => {self.path} as {redirect_msg}')
 
         SimpleHTTPRequestHandler.do_GET(self)
-        return;
+        return
 
-    def do_post(self):
+    def do_POST(self):
         post_msg = None
         try:
             if self.path == "/api/mp/models/graph":
@@ -465,7 +465,7 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
             if post_msg is not None:
                 logging.info(f'Handling a post request on {self.path}: {post_msg}')
 
-        self.do_GET()  # just treat the POST as a get otherwise:)
+        self.do_GET()  # just treat the POST as a get otherwise :)
 
     def guess_type(self, path):
         res = SimpleHTTPRequestHandler.guess_type(self, path)
@@ -479,11 +479,11 @@ ADVANCED_DOWNLOAD_ALL = False
 GRAPH_DATA_REQ = {}
 
 
-def open_dir_read_graph_reqs(path, pageId):
+def open_dir_read_graph_reqs(path, page_id):
     for root, dirs, filenames in os.walk(path):
         for file in filenames:
             with open(os.path.join(root, file), "r", encoding="UTF-8") as f:
-                GRAPH_DATA_REQ[file.replace(".json", "")] = f.read().replace("[MATTERPORT_MODEL_ID]", pageId)
+                GRAPH_DATA_REQ[file.replace(".json", "")] = f.read().replace("[MATTERPORT_MODEL_ID]", page_id)
 
 
 def get_url_opener(use_proxy):
