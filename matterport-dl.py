@@ -4,6 +4,7 @@
 Downloads virtual tours from matterport.
 Usage is either running this program with the URL/pageid as an argument or calling the initiateDownload(URL/pageid) method.
 '''
+import asyncio
 import concurrent.futures
 import decimal
 import json
@@ -13,12 +14,13 @@ import pathlib
 import re
 import shutil
 import sys
-import time
 import urllib.request
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+from multiprocessing import Pool
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 
+import aiohttp
 import requests
 from tqdm import tqdm
 
@@ -45,34 +47,39 @@ def get_variants():
     return variants
 
 
-def download_uuid(access_url, uuid):
-    download_file(access_url.format(filename=f'{uuid}_50k.dam'), f'{uuid}_50k.dam')
+async def download_uuid(access_url, uuid):
+    await download_file(access_url.format(filename=f'{uuid}_50k.dam'), f'{uuid}_50k.dam')
     shutil.copy(f'{uuid}_50k.dam', f'..{os.path.sep}{uuid}_50k.dam')
     cur_file = ""
     try:
         for i in range(1000):
             cur_file = access_url.format(filename=f'{uuid}_50k_texture_jpg_high/{uuid}_50k_{i:03d}.jpg')
-            download_file(cur_file, f'{uuid}_50k_texture_jpg_high/{uuid}_50k_{i:03d}.jpg')
+            await download_file(cur_file, f'{uuid}_50k_texture_jpg_high/{uuid}_50k_{i:03d}.jpg')
             cur_file = access_url.format(filename=f'{uuid}_50k_texture_jpg_low/{uuid}_50k_{i:03d}.jpg')
-            download_file(cur_file, f'{uuid}_50k_texture_jpg_low/{uuid}_50k_{i:03d}.jpg')
+            await download_file(cur_file, f'{uuid}_50k_texture_jpg_low/{uuid}_50k_{i:03d}.jpg')
     except Exception as ex:
         logging.warning(f'Exception downloading file: {cur_file} of: {str(ex)}')
         pass  # very lazy and bad way to only download required files
 
 
-def download_sweeps(access_url, sweeps):
-    with tqdm(total=(len(sweeps) * len(get_variants()))) as pbar:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
-            for sweep in sweeps:
-                for variant in get_variants():
-                    pbar.update(1)
-                    executor.submit(download_file, access_url.format(filename=f'tiles/{sweep}/{variant}') + "&imageopt=1",
-                                    f'tiles/{sweep}/{variant}')
-                    while executor._work_queue.qsize() > 64:
-                        time.sleep(0.01)
+async def download_sweeps(access_url, sweeps):
+    download_tasks = []
+    connector = aiohttp.TCPConnector(limit_per_host=4, loop=asyncio.get_running_loop())
+    async with aiohttp.ClientSession(connector=connector) as session:
+        for sweep in sweeps:
+            for variant in get_variants():
+                task = asyncio.create_task(
+                    download_file(
+                        access_url.format(filename=f'tiles/{sweep}/{variant}') + "&imageopt=1",
+                        f'tiles/{sweep}/{variant}',
+                        session=session,
+                    ),
+                )
+                download_tasks.append(task)
+        [await f for f in tqdm(asyncio.as_completed(download_tasks), total=len(download_tasks))]
 
 
-def download_file_with_json_post(url, file, post_json_str, descriptor):
+async def download_file_with_json_post(url, file, post_json_str, descriptor):
     global PROXY
     if "/" in file:
         make_dirs(os.path.dirname(file))
@@ -96,7 +103,26 @@ def download_file_with_json_post(url, file, post_json_str, descriptor):
     logging.debug(f'Successfully downloaded w/ JSON post to: {url} ({descriptor}) to: {file}')
 
 
-def download_file(url, file, post_data=None):
+async def inner_download_file(url, file, post_data, session):
+    if post_data is not None:
+        async with session.post(url, post_data) as response:
+            body = response.read()
+            with os.open(file, os.O_CREAT | os.O_RDWR, 0o644) as f:
+                f.write(body)
+            if response.status != 200:
+                logging.warning(f"invalid status code ${response.status} received")
+            logging.debug(f'Successfully downloaded: {url} to: {file}')
+    else:
+        async with session.get(url) as response:
+            body = await response.read()
+            with open(file, "wb") as f:
+                f.write(body)
+            if response.status != 200:
+                logging.warning(f"invalid status code ${response.status} received")
+            logging.debug(f'Successfully downloaded: {url} to: {file}')
+
+
+async def download_file(url, file, post_data=None, session=None):
     global access_urls
     url = get_or_replace_key(url, False)
 
@@ -106,13 +132,15 @@ def download_file(url, file, post_data=None):
         file = file.split('?')[0]
 
     if os.path.exists(file):
-        # skip already downloaded files except idnex.html which is really json possibly wit hnewer access keys?
+        # skip already downloaded files except index.html which is really json possibly wit hnewer access keys?
         logging.debug(f'Skipping url: {url} as already downloaded')
         return
     try:
-        _filename, headers = urllib.request.urlretrieve(url, file, None, post_data)
-        logging.debug(f'Successfully downloaded: {url} to: {file}')
-        return
+        if session is None:
+            async with aiohttp.ClientSession() as session:
+                await inner_download_file(url, file, post_data, session)
+        else:
+            await inner_download_file(url, file, post_data, session)
     except HTTPError as err:
         logging.warning(f'URL error downloading {url} of will try alt: {str(err)}')
 
@@ -132,13 +160,13 @@ def download_file(url, file, post_data=None):
         raise Exception
 
 
-def download_graph_models(pageid):
+async def download_graph_models():
     global GRAPH_DATA_REQ
     make_dirs("api/mp/models")
 
     for key in GRAPH_DATA_REQ:
         file_path = f"api/mp/models/graph_{key}.json"
-        download_file_with_json_post(
+        await download_file_with_json_post(
             "https://my.matterport.com/api/mp/models/graph",
             file_path,
             GRAPH_DATA_REQ[key],
@@ -146,9 +174,8 @@ def download_graph_models(pageid):
         )
 
 
-def download_assets(base):
-
-    download_file(base + "js/showcase.js", "js/showcase.js")
+async def download_assets(base):
+    await download_file(base + "js/showcase.js", "js/showcase.js")
     with open(f"js/showcase.js", "r", encoding="UTF-8") as f:
         showcase_cont = f.read()
     # lets try to extract the js files it might be loading and make sure we know them
@@ -165,17 +192,17 @@ def download_assets(base):
             image = image + ".png"
         files.assets.append("images/" + image)
     for js in files.js_files:
-        iles.assets.append("js/" + js + ".js")
+        files.assets.append("js/" + js + ".js")
     for f in files.font_files:
-        iles.assets.extend(["fonts/" + f + ".woff", "fonts/" + f + ".woff2"])
+        files.assets.extend(["fonts/" + f + ".woff", "fonts/" + f + ".woff2"])
     for lc in files.language_codes:
-        iles.assets.append("locale/messages/strings_" + lc + ".json")
+        files.assets.append("locale/messages/strings_" + lc + ".json")
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
         for asset in files.assets:
             local_file = asset
             if local_file.endswith('/'):
                 local_file = local_file + "index.html"
-            executor.submit(download_file, f"{base}{asset}", local_file)
+            await download_file(f"{base}{asset}", local_file)
 
 
 def set_access_urls(page_id):
@@ -188,7 +215,7 @@ def set_access_urls(page_id):
         access_urls.append(file_json["templates"][0].split("?")[-1])
 
 
-def download_info(page_id):
+async def download_info(page_id):
     assets = [f"api/v1/jsonstore/model/highlights/{page_id}", f"api/v1/jsonstore/model/Labels/{page_id}",
               f"api/v1/jsonstore/model/mattertags/{page_id}", f"api/v1/jsonstore/model/measurements/{page_id}",
               f"api/v1/player/models/{page_id}/thumb?width=1707&dpr=1.5&disable=upscale",
@@ -199,37 +226,36 @@ def download_info(page_id):
             local_file = asset
             if local_file.endswith('/'):
                 local_file = local_file + "index.html"
-            executor.submit(download_file, f"https://my.matterport.com/{asset}", local_file)
+            await download_file(f"https://my.matterport.com/{asset}", local_file)
     make_dirs("api/mp/models")
     with open(f"api/mp/models/graph", "w", encoding="UTF-8") as f:
         f.write('{"data": "empty"}')
     for i in range(1, 4):
-        download_file(f"https://my.matterport.com/api/player/models/{page_id}/files?type={i}",
-                     f"api/player/models/{page_id}/files_type{i}")
+        await download_file(f"https://my.matterport.com/api/player/models/{page_id}/files?type={i}",
+                            f"api/player/models/{page_id}/files_type{i}")
     set_access_urls(page_id)
 
 
-def download_pics(page_id):
+async def download_pics(page_id):
     with open(f"api/v1/player/models/{page_id}/index.html", "r", encoding="UTF-8") as f:
         model_data = json.load(f)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
         for image in model_data["images"]:
-            executor.submit(download_file, image["src"], urlparse(image["src"]).path[1:])
+            await download_file(image["src"], urlparse(image["src"]).path[1:])
 
 
-def download_model(page_id, access_url):
+async def download_model(page_id, access_url):
     global ADVANCED_DOWNLOAD_ALL
     with open(f"api/v1/player/models/{page_id}/index.html", "r", encoding="UTF-8") as f:
         model_data = json.load(f)
-    access_id = re.search(r'models/([a-z0-9-_./~]*)/\{filename\}', access_url).group(1)
+    access_id = re.search(r'models/([a-z0-9-_./~]*)/{filename}', access_url).group(1)
     make_dirs(f"models/{access_id}")
     os.chdir(f"models/{access_id}")
-    download_uuid(access_url, model_data["job"]["uuid"])
-    download_sweeps(access_url, model_data["sweeps"])
+    await download_uuid(access_url, model_data["job"]["uuid"])
+    await download_sweeps(access_url, model_data["sweeps"])
 
 
 # Patch showcase.js to fix expiration issue
-def patchShowcase():
+def patch_showcase():
     global SHOWCASE_INTERNAL_NAME
     with open("js/showcase.js", "r", encoding="UTF-8") as f:
         j = f.read()
@@ -268,10 +294,10 @@ def get_or_replace_key(url, is_read_key):
     return url
 
 
-def download_page(pageid):
+async def download_page(page_id):
     global ADVANCED_DOWNLOAD_ALL
-    make_dirs(pageid)
-    os.chdir(pageid)
+    make_dirs(page_id)
+    os.chdir(page_id)
 
     ADV_CROP_FETCH = [
         {
@@ -293,7 +319,7 @@ def download_page(pageid):
     logging.debug(f'Started up a download run')
     page_root_dir = os.path.abspath('.')
     print("Downloading base page...")
-    r = requests.get(f"https://my.matterport.com/show/?m={pageid}")
+    r = requests.get(f"https://my.matterport.com/show/?m={page_id}")
     r.encoding = "utf-8"
     staticbase = re.search(r'<base href="(https://static.matterport.com/.*?)">', r.text).group(1)
     match = re.search(r'"(https://cdn-\d*\.matterport\.com/models/[a-z0-9\-_/.]*/)([{}0-9a-z_/<>.]+)(\?t=.*?)"', r.text)
@@ -304,7 +330,7 @@ def download_page(pageid):
         raise Exception("Can't find urls")
 
     file_type_content = requests.get(
-        f"https://my.matterport.com/api/player/models/{pageid}/files?type=3")  # get a valid access key, there are a few but this is a common client used one, this also makes sure it is fresh
+        f"https://my.matterport.com/api/player/models/{page_id}/files?type=3")  # get a valid access key, there are a few but this is a common client used one, this also makes sure it is fresh
     get_or_replace_key(file_type_content.text, True)
     if ADVANCED_DOWNLOAD_ALL:
         print("Doing advanced download of dollhouse/floorplan data...")
@@ -323,7 +349,7 @@ def download_page(pageid):
                 for mesh in base_node["meshes"]:
                     try:
                         download_file(mesh["url"], urlparse(mesh["url"]).path[
-                                                  1:])  # not expecting the non 50k one to work but mgiht as well try
+                                                   1:])  # not expecting the non 50k one to work but mgiht as well try
                     except:
                         pass
                 for texture in base_node["textures"]:
@@ -346,7 +372,7 @@ def download_page(pageid):
                                         complete_add_file = complete_add.replace("&", "_")
                                         try:
                                             download_file(full_text_url + "&" + complete_add,
-                                                         urlparse(full_text_url).path[1:] + complete_add_file + ".jpg")
+                                                          urlparse(full_text_url).path[1:] + complete_add_file + ".jpg")
                                         except:
                                             pass
 
@@ -356,39 +382,40 @@ def download_page(pageid):
         except:
             pass
     # Automatic redirect if GET param isn't correct
-    injectedjs = 'if (window.location.search != "?m=' + pageid + '") { document.location.search = "?m=' + pageid + '"; }'
+    injected_js = 'if (window.location.search != "?m=' + page_id + '") { document.location.search = "?m=' + page_id + '"; }'
     content = r.text.replace(staticbase, ".").replace('"https://cdn-1.matterport.com/',
                                                       '`${window.location.origin}${window.location.pathname}` + "').replace(
         '"https://mp-app-prod.global.ssl.fastly.net/',
         '`${window.location.origin}${window.location.pathname}` + "').replace("window.MP_PREFETCHED_MODELDATA",
-                                                                              f"{injectedjs};window.MP_PREFETCHED_MODELDATA").replace(
+                                                                              f"{injected_js};window.MP_PREFETCHED_MODELDATA").replace(
         '"https://events.matterport.com/', '`${window.location.origin}${window.location.pathname}` + "')
     content = re.sub(r"validUntil\":\s*\"20[\d]{2}-[\d]{2}-[\d]{2}T", "validUntil\":\"2099-01-01T", content)
     with open("index.html", "w", encoding="UTF-8") as f:
         f.write(content)
 
     print("Downloading static assets...")
-    if os.path.exists(
-            "js/showcase.js"):  # we want to always fetch showcase.js in case we patch it differently or the patching function starts to not work well run multiple times on itself
+    if os.path.exists("js/showcase.js"):
+        # we want to always fetch showcase.js in case we patch it differently or the patching function starts to not
+        # work well run multiple times on itself
         os.replace("js/showcase.js", "js/showcase-bk.js")  # backing up existing showcase file to be safe
-    download_assets(staticbase)
+    await download_assets(staticbase)
     # Patch showcase.js to fix expiration issue and some other changes for local hosting
-    patchShowcase()
+    patch_showcase()
     print("Downloading model info...")
-    download_info(pageid)
+    await download_info(page_id)
     print("Downloading images...")
-    download_pics(pageid)
+    await download_pics(page_id)
     print("Downloading graph model data...")
-    download_graph_models(pageid)
+    await download_graph_models()
     print(f"Downloading model... access url: {accessurl}")
-    download_model(pageid, accessurl)
+    await download_model(page_id, accessurl)
     os.chdir(page_root_dir)
     open("api/v1/event", 'a').close()
     print("Done!")
 
 
-def initiate_download(url):
-    download_page(get_page_id(url))
+async def initiate_download(url):
+    await download_page(get_page_id(url))
 
 
 def get_page_id(url):
@@ -452,7 +479,7 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
                         with open(file_path, "r", encoding="UTF-8") as f:
                             self.wfile.write(f.read().encode('utf-8'))
                             post_msg = f"graph of operationName: {option_name} we are handling internally"
-                            return;
+                            return
                     else:
                         post_msg = f"graph for operationName: {option_name} we don't know how to handle, but likely could add support, returning empty instead"
 
@@ -508,19 +535,20 @@ def get_command_line_arg(name, has_value):
     return False
 
 
-if __name__ == "__main__":
+async def main():
+    global ADVANCED_DOWNLOAD_ALL, PROXY
     ADVANCED_DOWNLOAD_ALL = get_command_line_arg("--advanced-download", False)
     PROXY = get_command_line_arg("--proxy", True)
     OUR_OPENER = get_url_opener(PROXY)
     urllib.request.install_opener(OUR_OPENER)
-    pageId = ""
+    page_id = ""
     if len(sys.argv) > 1:
-        pageId = get_page_id(sys.argv[1])
-    open_dir_read_graph_reqs("graph_posts", pageId)
+        page_id = get_page_id(sys.argv[1])
+    open_dir_read_graph_reqs("graph_posts", page_id)
     if len(sys.argv) == 2:
-        initiate_download(pageId)
+        await initiate_download(page_id)
     elif len(sys.argv) == 4:
-        os.chdir(get_page_id(pageId))
+        os.chdir(get_page_id(page_id))
         try:
             logging.basicConfig(filename='server.log', encoding='utf-8', level=logging.DEBUG,
                                 format='%(asctime)s %(levelname)-8s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -533,7 +561,7 @@ if __name__ == "__main__":
         httpd.serve_forever()
     else:
         print(f"""Matterport Downloader
-        
+
 Archiving:
 matterport-dl.py URL_OR_PAGE_ID
 
@@ -544,3 +572,7 @@ Arguments:
 --advanced-download \t Use this option to try and download the cropped files for dollhouse/floorplan support
 --proxy \t\t\t\t Specifies a proxy (e.g: 127.0.0.1:3128)
 """)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
